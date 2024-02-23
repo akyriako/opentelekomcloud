@@ -26,7 +26,7 @@ type OpenTelekomCloudClient struct {
 
 func NewOpenTelekomCloudClient(cloud string) (*OpenTelekomCloudClient, error) {
 	cfg := Config{
-		Cloud: "eu-de",
+		Cloud: cloud,
 	}
 
 	client, err := cfg.LoadAndValidate()
