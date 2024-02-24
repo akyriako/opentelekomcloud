@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -18,6 +19,13 @@ import (
 const (
 	osPrefix = "OS_"
 )
+
+var validEndpoints = []string{
+	"internal", "internalURL",
+	"admin", "adminURL",
+	"public", "publicURL",
+	"",
+}
 
 type OpenTelekomCloudClient struct {
 	config        *Config
@@ -119,13 +127,6 @@ func (c *Config) LoadAndValidate() (*OpenTelekomCloudClient, error) {
 	return client, nil
 }
 
-// setIfEmpty set non-empty `loaded` value to empty `target` variable
-func setIfEmpty(target *string, loaded string) {
-	if *target == "" && loaded != "" {
-		*target = loaded
-	}
-}
-
 // Load - load existing configuration from config files (`clouds.yaml`, etc.) and env variables
 func (c *Config) Load() error {
 	if c.environment == nil {
@@ -217,13 +218,6 @@ func (c *Config) generateTLSConfig() (*tls.Config, error) {
 	return config, nil
 }
 
-var validEndpoints = []string{
-	"internal", "internalURL",
-	"admin", "adminURL",
-	"public", "publicURL",
-	"",
-}
-
 func (c *Config) validateEndpoint() error {
 	for _, endpoint := range validEndpoints {
 		if c.EndpointType == endpoint {
@@ -239,6 +233,128 @@ func (c *Config) validateProject() error {
 		return errors.New("no project name/id or delegated project is provided")
 	}
 	return nil
+}
+
+func (c *Config) genClients(pao, dao golangsdk.AuthOptionsProvider) (*OpenTelekomCloudClient, error) {
+	pClient, err := c.genClient(pao)
+	if err != nil {
+		return nil, fmt.Errorf("error generating project client: %w", err)
+	}
+
+	dClient, err := c.genClient(dao)
+	if err != nil {
+		return nil, fmt.Errorf("error generating domain client: %w", err)
+	}
+
+	client := &OpenTelekomCloudClient{
+		config:        c,
+		ProjectClient: pClient,
+		DomainClient:  dClient,
+	}
+
+	return client, nil
+}
+
+func (c *Config) genClient(ao golangsdk.AuthOptionsProvider) (*golangsdk.ProviderClient, error) {
+	client, err := openstack.NewClient(ao.GetIdentityEndpoint())
+	if err != nil {
+		return nil, err
+	}
+
+	// Set UserAgent
+	if strings.TrimSpace(c.UserAgent) != "" {
+		client.UserAgent.Prepend(c.UserAgent)
+	}
+
+	config, err := c.generateTLSConfig()
+	if err != nil {
+		return nil, err
+	}
+	transport := &http.Transport{Proxy: http.ProxyFromEnvironment, TLSClientConfig: config}
+
+	// if OS_DEBUG is set, log the requests and responses
+	var osDebug bool
+	if os.Getenv("OS_DEBUG") != "" {
+		osDebug = true
+	}
+
+	client.MaxBackoffRetries = pointerto.Int(c.MaxBackoffRetries)
+	defaultBackoffTimeout := time.Duration(c.BackoffRetryTimeout) * time.Second
+	client.BackoffRetryTimeout = &defaultBackoffTimeout
+
+	client.HTTPClient = http.Client{
+		Transport: &RoundTripper{
+			Rt:         transport,
+			OsDebug:    osDebug,
+			MaxRetries: c.MaxRetries,
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if client.AKSKAuthOptions.AccessKey != "" {
+				golangsdk.ReSign(req, golangsdk.SignOptions{
+					AccessKey: client.AKSKAuthOptions.AccessKey,
+					SecretKey: client.AKSKAuthOptions.SecretKey,
+				})
+			}
+			return nil
+		},
+	}
+
+	// If using Swift Authentication, there's no need to validate authentication normally.
+	if !c.Swauth {
+		err = openstack.Authenticate(client, ao)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	setIfEmpty(&c.Region, client.RegionID)
+
+	return client, nil
+}
+
+func (c *Config) genOpenstackClient(ao golangsdk.AuthOptionsProvider) (*golangsdk.ProviderClient, error) {
+	client, err := openstack.NewClient(ao.GetIdentityEndpoint())
+	if err != nil {
+		return nil, err
+	}
+
+	client.HTTPClient = http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if client.AKSKAuthOptions.AccessKey != "" {
+				golangsdk.ReSign(req, golangsdk.SignOptions{
+					AccessKey: client.AKSKAuthOptions.AccessKey,
+					SecretKey: client.AKSKAuthOptions.SecretKey,
+				})
+			}
+			return nil
+		},
+	}
+
+	err = openstack.Authenticate(client, ao)
+	if err != nil {
+		return nil, err
+	}
+
+	setIfEmpty(&c.Region, client.RegionID)
+
+	return client, nil
+}
+
+func (c *Config) getEndpointType() golangsdk.Availability {
+	if c.EndpointType == "internal" || c.EndpointType == "internalURL" {
+		return golangsdk.AvailabilityInternal
+	}
+	if c.EndpointType == "admin" || c.EndpointType == "adminURL" {
+		return golangsdk.AvailabilityAdmin
+	}
+	return golangsdk.AvailabilityPublic
+}
+
+// setIfEmpty set non-empty `loaded` value to empty `target` variable
+func setIfEmpty(target *string, loaded string) {
+	if *target == "" && loaded != "" {
+		*target = loaded
+	}
 }
 
 func buildClientByToken(c *Config) (*OpenTelekomCloudClient, error) {
@@ -362,124 +478,4 @@ func buildClientByPassword(c *Config) (*OpenTelekomCloudClient, error) {
 	}
 
 	return c.genClients(pao, dao)
-}
-
-func (c *Config) genClients(pao, dao golangsdk.AuthOptionsProvider) (*OpenTelekomCloudClient, error) {
-	pClient, err := c.genClient(pao)
-	if err != nil {
-		return nil, fmt.Errorf("error generating project client: %w", err)
-	}
-
-	dClient, err := c.genClient(dao)
-	if err != nil {
-		return nil, fmt.Errorf("error generating domain client: %w", err)
-	}
-
-	client := &OpenTelekomCloudClient{
-		config:        c,
-		ProjectClient: pClient,
-		DomainClient:  dClient,
-	}
-
-	return client, nil
-}
-
-func (c *Config) genClient(ao golangsdk.AuthOptionsProvider) (*golangsdk.ProviderClient, error) {
-	client, err := openstack.NewClient(ao.GetIdentityEndpoint())
-	if err != nil {
-		return nil, err
-	}
-
-	// Set UserAgent
-	if strings.TrimSpace(c.UserAgent) != "" {
-		client.UserAgent.Prepend(c.UserAgent)
-	}
-
-	//config, err := c.generateTLSConfig()
-	//if err != nil {
-	//	return nil, err
-	//}
-	//transport := &http.Transport{Proxy: http.ProxyFromEnvironment, TLSClientConfig: config}
-
-	// if OS_DEBUG is set, log the requests and responses
-	//var osDebug bool
-	//if os.Getenv("OS_DEBUG") != "" {
-	//	osDebug = true
-	//}
-
-	client.MaxBackoffRetries = pointerto.Int(c.MaxBackoffRetries)
-	defaultBackoffTimeout := time.Duration(c.BackoffRetryTimeout) * time.Second
-	client.BackoffRetryTimeout = &defaultBackoffTimeout
-
-	client.HTTPClient = http.Client{
-		//Transport: &RoundTripper{
-		//	Rt:         transport,
-		//	OsDebug:    osDebug,
-		//	MaxRetries: c.MaxRetries,
-		//},
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if client.AKSKAuthOptions.AccessKey != "" {
-				golangsdk.ReSign(req, golangsdk.SignOptions{
-					AccessKey: client.AKSKAuthOptions.AccessKey,
-					SecretKey: client.AKSKAuthOptions.SecretKey,
-				})
-			}
-			return nil
-		},
-	}
-
-	// If using Swift Authentication, there's no need to validate authentication normally.
-	//if !c.Swauth {
-	//	err = openstack.Authenticate(client, ao)
-	//	if err != nil {
-	//		return nil, err
-	//	}
-	//}
-
-	err = openstack.Authenticate(client, ao)
-	if err != nil {
-		return nil, err
-	}
-
-	setIfEmpty(&c.Region, client.RegionID)
-
-	return client, nil
-}
-
-func (c *Config) genOpenstackClient(ao golangsdk.AuthOptionsProvider) (*golangsdk.ProviderClient, error) {
-	client, err := openstack.NewClient(ao.GetIdentityEndpoint())
-	if err != nil {
-		return nil, err
-	}
-
-	client.HTTPClient = http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if client.AKSKAuthOptions.AccessKey != "" {
-				golangsdk.ReSign(req, golangsdk.SignOptions{
-					AccessKey: client.AKSKAuthOptions.AccessKey,
-					SecretKey: client.AKSKAuthOptions.SecretKey,
-				})
-			}
-			return nil
-		},
-	}
-
-	err = openstack.Authenticate(client, ao)
-	if err != nil {
-		return nil, err
-	}
-
-	setIfEmpty(&c.Region, client.RegionID)
-
-	return client, nil
-}
-
-func (c *Config) getEndpointType() golangsdk.Availability {
-	if c.EndpointType == "internal" || c.EndpointType == "internalURL" {
-		return golangsdk.AvailabilityInternal
-	}
-	if c.EndpointType == "admin" || c.EndpointType == "adminURL" {
-		return golangsdk.AvailabilityAdmin
-	}
-	return golangsdk.AvailabilityPublic
 }
