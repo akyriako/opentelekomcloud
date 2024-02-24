@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	golangsdk "github.com/opentelekomcloud/gophertelekomcloud"
@@ -69,9 +70,6 @@ type Config struct {
 
 	UserAgent string
 
-	//ProjectClient *golangsdk.ProviderClient
-	//DomainClient  *golangsdk.ProviderClient
-
 	environment *openstack.Env
 }
 
@@ -107,8 +105,7 @@ func (c *Config) LoadAndValidate() (*OpenTelekomCloudClient, error) {
 	case c.Password != "" && (c.Username != "" || c.UserID != ""):
 		client, err = buildClientByPassword(c)
 	default:
-		err = errors.New(
-			"no auth means provided. Token, AK/SK or username/password are required for authentication")
+		err = fmt.Errorf("no auth means provided. Token, AK/SK or username/password are required for authentication")
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to authenticate:\n%s", err)
@@ -147,6 +144,12 @@ func (c *Config) Load() error {
 		c.Username = ""
 	}
 
+	setIfEmpty(&c.IdentityEndpoint, cloud.AuthInfo.AuthURL)
+	setIfEmpty(&c.Token, cloud.AuthInfo.Token)
+	setIfEmpty(&c.Password, cloud.AuthInfo.Password)
+	setIfEmpty(&c.AccessKey, cloud.AuthInfo.AccessKey)
+	setIfEmpty(&c.SecretKey, cloud.AuthInfo.SecretKey)
+
 	setIfEmpty(&c.TenantName, cloud.AuthInfo.ProjectName)
 	setIfEmpty(&c.TenantID, cloud.AuthInfo.ProjectID)
 	setIfEmpty(&c.DomainName, cloud.AuthInfo.DomainName)
@@ -162,10 +165,6 @@ func (c *Config) Load() error {
 
 	// default domain
 	setIfEmpty(&c.DomainID, cloud.AuthInfo.DefaultDomain)
-
-	setIfEmpty(&c.IdentityEndpoint, cloud.AuthInfo.AuthURL)
-	setIfEmpty(&c.Token, cloud.AuthInfo.Token)
-	setIfEmpty(&c.Password, cloud.AuthInfo.Password)
 
 	// General cloud info
 	setIfEmpty(&c.Region, cloud.RegionName)
@@ -392,7 +391,9 @@ func (c *Config) genClient(ao golangsdk.AuthOptionsProvider) (*golangsdk.Provide
 	}
 
 	// Set UserAgent
-	client.UserAgent.Prepend(c.UserAgent)
+	if strings.TrimSpace(c.UserAgent) != "" {
+		client.UserAgent.Prepend(c.UserAgent)
+	}
 
 	//config, err := c.generateTLSConfig()
 	//if err != nil {
@@ -428,40 +429,50 @@ func (c *Config) genClient(ao golangsdk.AuthOptionsProvider) (*golangsdk.Provide
 	}
 
 	// If using Swift Authentication, there's no need to validate authentication normally.
-	if !c.Swauth {
-		err = openstack.Authenticate(client, ao)
-		if err != nil {
-			return nil, err
-		}
+	//if !c.Swauth {
+	//	err = openstack.Authenticate(client, ao)
+	//	if err != nil {
+	//		return nil, err
+	//	}
+	//}
+
+	err = openstack.Authenticate(client, ao)
+	if err != nil {
+		return nil, err
 	}
 
-	c.Region = client.RegionID
+	setIfEmpty(&c.Region, client.RegionID)
 
 	return client, nil
 }
 
-// issueTemporaryCredentials creates temporary AK/SK, which can be used to auth in OBS when AK/SK is not provided
-//func (c *Config) issueTemporaryCredentials() (*credentials.TemporaryCredential, error) {
-//	if c.AccessKey != "" && c.SecretKey != "" {
-//		return &credentials.TemporaryCredential{
-//			AccessKey:     c.AccessKey,
-//			SecretKey:     c.SecretKey,
-//			SecurityToken: c.SecurityToken,
-//		}, nil
-//	}
-//	client, err := c.IdentityV3Client()
-//	if err != nil {
-//		return nil, fmt.Errorf("error creating identity v3 domain client: %s", err)
-//	}
-//	credential, err := credentials.CreateTemporary(client, credentials.CreateTemporaryOpts{
-//		Methods: []string{"token"},
-//		Token:   client.Token(),
-//	}).Extract()
-//	if err != nil {
-//		return nil, fmt.Errorf("error creating temporary AK/SK: %s", err)
-//	}
-//	return credential, nil
-//}
+func (c *Config) genOpenstackClient(ao golangsdk.AuthOptionsProvider) (*golangsdk.ProviderClient, error) {
+	client, err := openstack.NewClient(ao.GetIdentityEndpoint())
+	if err != nil {
+		return nil, err
+	}
+
+	client.HTTPClient = http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if client.AKSKAuthOptions.AccessKey != "" {
+				golangsdk.ReSign(req, golangsdk.SignOptions{
+					AccessKey: client.AKSKAuthOptions.AccessKey,
+					SecretKey: client.AKSKAuthOptions.SecretKey,
+				})
+			}
+			return nil
+		},
+	}
+
+	err = openstack.Authenticate(client, ao)
+	if err != nil {
+		return nil, err
+	}
+
+	setIfEmpty(&c.Region, client.RegionID)
+
+	return client, nil
+}
 
 func (c *Config) getEndpointType() golangsdk.Availability {
 	if c.EndpointType == "internal" || c.EndpointType == "internalURL" {
@@ -472,9 +483,3 @@ func (c *Config) getEndpointType() golangsdk.Availability {
 	}
 	return golangsdk.AvailabilityPublic
 }
-
-//func (c *Config) IdentityV3Client(_ ...string) (*golangsdk.ServiceClient, error) {
-//	return openstack.NewIdentityV3(c.DomainClient, golangsdk.EndpointOpts{
-//		Availability: c.getEndpointType(),
-//	})
-//}

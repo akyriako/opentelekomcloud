@@ -7,7 +7,9 @@ import (
 )
 
 func main() {
-	client, err := common.NewOpenTelekomCloudClient("eu-de")
+	cloud := os.Getenv("OS_CLOUD")
+
+	client, err := common.NewOpenTelekomCloudClient(cloud)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
