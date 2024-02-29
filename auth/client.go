@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -118,11 +119,6 @@ func (c *Config) LoadAndValidate() (*OpenTelekomCloudClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to authenticate:\n%s", err)
 	}
-
-	//var osDebug bool
-	//if os.Getenv("OS_DEBUG") != "" {
-	//	osDebug = true
-	//}
 
 	return client, nil
 }
@@ -273,9 +269,12 @@ func (c *Config) genClient(ao golangsdk.AuthOptionsProvider) (*golangsdk.Provide
 	transport := &http.Transport{Proxy: http.ProxyFromEnvironment, TLSClientConfig: config}
 
 	// if OS_DEBUG is set, log the requests and responses
-	var osDebug bool
-	if os.Getenv("OS_DEBUG") != "" {
-		osDebug = true
+	osDebug := false
+	val, ok := os.LookupEnv("OS_DEBUG")
+	if ok {
+		if bVal, err := strconv.ParseBool(val); err == nil {
+			osDebug = bVal
+		}
 	}
 
 	client.MaxBackoffRetries = pointerto.Int(c.MaxBackoffRetries)
